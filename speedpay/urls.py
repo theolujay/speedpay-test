@@ -25,6 +25,7 @@ urlpatterns = [
         serve,
         {"path": "favicon.ico", "document_root": settings.BASE_DIR},
     ),
+    path("api/docs/", RedirectView.as_view(url="/docs", permanent=False)),
     path("docs/", partial(openapi_view, api=api), name="openapi-view"),
     path("", RedirectView.as_view(url="docs/", permanent=False)),
 ]

@@ -34,7 +34,7 @@ echo "==> Building and starting services..."
 docker compose up --build -d
 
 echo "==> Waiting for the app to be ready..."
-until curl -sf http://localhost:8000/api/docs >/dev/null 2>&1; do
+until curl -sf http://localhost:8000/docs >/dev/null 2>&1; do
   sleep 2
 done
 
@@ -59,7 +59,7 @@ echo ""
 echo "================================"
 echo "  Speedpay is ready!"
 echo "================================"
-echo "  API docs:  http://localhost:8000/api/docs"
+echo "  API docs:  http://localhost:8000/docs"
 echo "  Admin email:    $ADMIN_EMAIL"
 echo "  Admin password: $ADMIN_PASS"
 echo "================================"
