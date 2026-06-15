@@ -1,0 +1,100 @@
+---
+networks:
+  speedpay_dev:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+x-security: &security
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+
+x-dns: &dns
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+
+x-app-base: &app-base
+  <<: [*dns, *security]
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://speedpay:speedpay@db:5432/speedpay
+  image: speedpay:dev
+  logging:
+    driver: "local"
+    options:
+      max-buffer-size: "4m"
+      max-file: "3"
+      max-size: "10m"
+      mode: "non-blocking"
+  networks:
+    - speedpay_dev
+  pull_policy: never
+
+x-app-depends: &app-depends
+  depends_on:
+    db:
+      condition: service_healthy
+    db_migration:
+      condition: service_completed_successfully
+
+services:
+  db:
+    container_name: speedpay_db
+    image: postgres:18.4-bookworm
+    env_file: .env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - speedpay_dev
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+  db_migration:
+    container_name: speedpay_db_migration
+    <<: *app-base
+    command: ["scripts/runmigrations.sh"]
+    deploy:
+      mode: replicated-job
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+        window: 120s
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ""
+
+  app:
+    <<: [*app-base, *app-depends]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: speedpay_app
+    command: uvicorn speedpay.asgi:application --host 0.0.0.0 --port 8000 --reload
+    develop:
+      watch:
+        - action: sync
+          path: .
+          target: /app
+        - action: rebuild
+          path: ./uv.lock
+    entrypoint: ["scripts/entrypoint.sh"]
+    ports:
+      - "8000:8000"
+

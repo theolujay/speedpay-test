@@ -1,0 +1,228 @@
+---
+# Speedpay Docker Swarm stack.
+# Deploy:
+#   docker stack deploy -c infra/stack.yml speedpay
+#
+# Prerequisites (one-time setup):
+#   1. docker swarm init
+#   2. docker network create --driver overlay --attachable speedpay_net
+#   3. ./scripts/make-secrets.sh .env.prod --create
+#   4. docker stack deploy -c infra/stack.yml speedpay
+
+x-security: &security
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+
+x-dns: &dns
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options:
+      mode: "non-blocking"
+      max-buffer-size: "4m"
+      max-size: "10m"
+      max-file: "3"
+
+x-deploy: &deploy
+  update_config:
+    order: start-first
+    failure_action: rollback
+    delay: 10s
+  restart_policy:
+    condition: on-failure
+    delay: 15s
+    max_attempts: 3
+    window: 120s
+
+x-app-base: &app-base
+  image: ${IMAGE_REPO:-ghcr.io/theolujay/speedpay}:${GIT_COMMIT_HASH:-latest}
+  entrypoint: scripts/entrypoint.sh
+  <<: [*dns, *security, *logging]
+  networks:
+    - speedpay_net
+
+x-app-secrets: &app-secrets
+  - source: speedpay_db_name
+    target: db_name
+  - source: speedpay_db_user
+    target: db_user
+  - source: speedpay_db_password
+    target: db_password
+  - source: speedpay_secret_key
+    target: secret_key
+  - source: speedpay_paystack_secret_key
+    target: paystack_secret_key
+  - source: speedpay_paystack_public_key
+    target: paystack_public_key
+
+x-app-env: &app-env
+  ENVIRONMENT: production
+  DEBUG: "false"
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME__FILE: /run/secrets/db_name
+  DB_USER__FILE: /run/secrets/db_user
+  DB_PASSWORD__FILE: /run/secrets/db_password
+  SECRET_KEY__FILE: /run/secrets/secret_key
+  PAYSTACK_SECRET_KEY__FILE: /run/secrets/paystack_secret_key
+  PAYSTACK_PUBLIC_KEY__FILE: /run/secrets/paystack_public_key
+  DOMAIN: ${DOMAIN:-speedpay.theolujay.dev}
+  ALLOWED_HOSTS: ${DOMAIN:-speedpay.theolujay.dev},localhost
+  CALLBACK_URL: https://${DOMAIN:-speedpay.theolujay.dev}/api/docs
+
+networks:
+  speedpay_net:
+    external: true
+
+volumes:
+  postgres_data:
+
+secrets:
+  speedpay_db_name:
+    external: true
+  speedpay_db_user:
+    external: true
+  speedpay_db_password:
+    external: true
+  speedpay_secret_key:
+    external: true
+  speedpay_paystack_secret_key:
+    external: true
+  speedpay_paystack_public_key:
+    external: true
+
+services:
+  traefik:
+    image: traefik:v3.7.5
+    command:
+      - "--api.insecure=false"
+      - "--providers.swarm=true"
+      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--providers.swarm.network=speedpay_net"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:-admin@speedpay.theolujay.dev}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.caserver=https://acme-v02.api.letsencrypt.org/directory"
+      - "--log.level=WARN"
+      - "--log.format=json"
+      - "--accesslog=true"
+    volumes:
+      - letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - speedpay_net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.2'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+
+  db:
+    image: postgres:18.4-bookworm
+    secrets:
+      - source: speedpay_db_name
+        target: db_name
+      - source: speedpay_db_user
+        target: db_user
+      - source: speedpay_db_password
+        target: db_password
+    environment:
+      POSTGRES_DB_FILE: /run/secrets/db_name
+      POSTGRES_USER_FILE: /run/secrets/db_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$(cat /run/secrets/db_user) -d $$(cat /run/secrets/db_name)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - speedpay_net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  db_migrate:
+    <<: *app-base
+    entrypoint: ""
+    command: ["scripts/runmigrations.sh"]
+    secrets: *app-secrets
+    environment: *app-env
+    deploy:
+      mode: replicated-job
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+        max_attempts: 5
+        window: 300s
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 128M
+          cpus: '0.15'
+
+  app:
+    <<: *app-base
+    stop_grace_period: 30s
+    command: ["uvicorn", "speedpay.asgi:application", "--host", "0.0.0.0", "--port", "8000"]
+    secrets: *app-secrets
+    environment:
+      <<: *app-env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=speedpay_net"
+      - "traefik.http.services.speedpay.loadbalancer.server.port=8000"
+      - "traefik.http.routers.speedpay.rule=Host(`${DOMAIN:-speedpay.theolujay.dev}`)"
+      - "traefik.http.routers.speedpay.entrypoints=websecure"
+      - "traefik.http.routers.speedpay.tls.certresolver=le"
+      - "traefik.http.routers.speedpay.service=speedpay"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      <<: *deploy
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'

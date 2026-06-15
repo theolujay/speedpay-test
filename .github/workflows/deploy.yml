@@ -1,0 +1,349 @@
+---
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - stag
+    paths-ignore:
+      - "**.md"
+      - ".github/**"
+      - "library/**"
+      - "Makefile"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      repo_name: ${{ steps.meta.outputs.REPO_NAME }}
+      repo_owner: ${{ steps.meta.outputs.REPO_OWNER }}
+      short_sha: ${{ steps.meta.outputs.SHORT_SHA }}
+      version: ${{ steps.meta.outputs.VERSION }}
+      env_name: ${{ steps.env.outputs.ENV_NAME }}
+      env_short: ${{ steps.env.outputs.ENV_SHORT }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set environment
+        id: env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "ENV_NAME=production" >> "$GITHUB_OUTPUT"
+            echo "ENV_SHORT=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "ENV_NAME=staging" >> "$GITHUB_OUTPUT"
+            echo "ENV_SHORT=stag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "REPO_NAME=$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "REPO_OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$(date +'%Y.%m.%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-24.04
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              compression-type = "zstd"
+              compression-level = 3
+
+      - name: Build test image (with dev deps)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          tags: speedpay-test:${{ needs.prepare.outputs.short_sha }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run tests
+        run: |
+          docker run --rm \
+            -e ENVIRONMENT=test \
+            speedpay-test:${{ needs.prepare.outputs.short_sha }} \
+            sh -c "cd /app && python -m pytest -v"
+        timeout-minutes: 10
+
+      - name: Clean up Docker
+        if: always()
+        run: docker system prune -af --volumes || true
+
+  build:
+    runs-on: ubuntu-24.04
+    needs: [prepare, test]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              compression-type = "zstd"
+              compression-level = 3
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: base
+          push: true
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}:${{ needs.prepare.outputs.env_short }}
+            ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}:${{ needs.prepare.outputs.short_sha }}
+            ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}:${{ needs.prepare.outputs.version }}
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}:buildcache-${{ needs.prepare.outputs.env_short }}
+          cache-to: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}:buildcache-${{ needs.prepare.outputs.env_short }},mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+
+      - name: Clean up Docker
+        if: always()
+        run: docker system prune -af --volumes || true
+
+  backup:
+    runs-on: ubuntu-24.04
+    needs: [prepare, test]
+    environment: ${{ needs.prepare.outputs.env_name }}
+    steps:
+      - name: Backup database via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        continue-on-error: true
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            set -e
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            CONTAINER=$(docker ps -q -f name=speedpay_db)
+            if [ -n "$CONTAINER" ]; then
+              docker exec "$CONTAINER" pg_dump -U $$(cat /run/secrets/speedpay_db_user) speedpay > /tmp/speedpay_backup_$TIMESTAMP.sql
+              gzip /tmp/speedpay_backup_$TIMESTAMP.sql
+              ls -t /tmp/speedpay_backup_*.sql.gz | tail -n +8 | xargs -r rm
+              echo "Backup saved: speedpay_backup_$TIMESTAMP.sql.gz"
+            else
+              echo "No database container found; skipping backup."
+            fi
+
+  deploy:
+    runs-on: ubuntu-24.04
+    needs: [prepare, backup, build]
+    environment: ${{ needs.prepare.outputs.env_name }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create deployment metadata
+        run: |
+          cat > deployment-info.json << EOF
+          {
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit_sha": "${{ github.sha }}",
+            "short_sha": "${{ needs.prepare.outputs.short_sha }}",
+            "version": "${{ needs.prepare.outputs.version }}",
+            "environment": "${{ needs.prepare.outputs.env_name }}",
+            "deployed_by": "${{ github.actor }}"
+          }
+          EOF
+          cat deployment-info.json
+
+      - name: Create env file
+        run: |
+          echo "GIT_COMMIT_HASH=${{ needs.prepare.outputs.short_sha }}" > ./envfile
+          echo "IMAGE_REPO=ghcr.io/${{ needs.prepare.outputs.repo_owner }}/${{ needs.prepare.outputs.repo_name }}" >> ./envfile
+          echo "DOMAIN=${{ secrets.DOMAIN || 'speedpay.theolujay.dev' }}" >> ./envfile
+
+      - name: Deploy stack via SSH
+        uses: cssnr/stack-deploy-action@v1.5.0
+        with:
+          name: speedpay
+          file: infra/stack.yml
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          user: ${{ secrets.DEPLOY_SSH_USER }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          registry_auth: true
+          registry_host: ghcr.io
+          registry_user: ${{ needs.prepare.outputs.repo_owner }}
+          registry_pass: ${{ secrets.GITHUB_TOKEN }}
+          resolve_image: changed
+          prune: true
+          mode: swarm
+          env_file: ./envfile
+          summary: true
+
+  verify:
+    runs-on: ubuntu-24.04
+    needs: [prepare, deploy]
+    environment: ${{ needs.prepare.outputs.env_name }}
+
+    steps:
+      - name: Wait for deployment health check
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            echo "Waiting for services to be healthy..."
+
+            for i in {1..30}; do
+              REPLICAS=$(docker service ls --filter name=speedpay_app --format "{{.Replicas}}")
+
+              if [ -n "$REPLICAS" ] && ! echo "$REPLICAS" | grep -q "0/"; then
+                echo "All services are up!"
+
+                STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "https://${{ secrets.DOMAIN || 'speedpay.theolujay.dev' }}/api/docs" 2>/dev/null || echo "000")
+                if [ "$STATUS" = "200" ]; then
+                  echo "Health check passed! HTTP $STATUS"
+                  exit 0
+                else
+                  echo "Health check returned HTTP $STATUS"
+                fi
+              fi
+
+              echo "Attempt $i/30: Services not ready yet..."
+              sleep 10
+            done
+
+            echo "Deployment health check failed!"
+            exit 1
+        timeout-minutes: 6
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: [prepare, verify]
+    if: github.ref_name == 'main'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: Production Release ${{ needs.prepare.outputs.version }}
+          body: |
+            Speedpay production deployment
+
+            **Deployed by**: @${{ github.actor }}
+            **Commit**: ${{ github.sha }}
+            **Short SHA**: ${{ needs.prepare.outputs.short_sha }}
+            **Version**: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+
+  notify:
+    runs-on: ubuntu-24.04
+    needs: [prepare, verify]
+    if: always()
+    environment: ${{ needs.prepare.outputs.env_name }}
+
+    steps:
+      - name: Determine deployment status
+        id: status
+        run: |
+          if [ "${{ needs.verify.result }}" == "success" ]; then
+            echo "STATUS=success" >> "$GITHUB_OUTPUT"
+            echo "STATUS_EMOJI=✅" >> "$GITHUB_OUTPUT"
+            echo "COLOR=good" >> "$GITHUB_OUTPUT"
+          else
+            echo "STATUS=failed" >> "$GITHUB_OUTPUT"
+            echo "STATUS_EMOJI=❌" >> "$GITHUB_OUTPUT"
+            echo "COLOR=danger" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "Speedpay ${{ needs.prepare.outputs.env_name }} deployment ${{ steps.status.outputs.STATUS_EMOJI }}",
+              "attachments": [{
+                "color": "${{ steps.status.outputs.COLOR }}",
+                "fields": [
+                  {"title": "Status", "value": "${{ steps.status.outputs.STATUS }}", "short": true},
+                  {"title": "Commit", "value": "${{ needs.prepare.outputs.short_sha }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Actor", "value": "${{ github.actor }}", "short": true},
+                  {"title": "Version", "value": "${{ needs.prepare.outputs.version }}", "short": true}
+                ]
+              }]
+            }'
+        continue-on-error: true
+
+      - name: Log deployment to server
+        uses: appleboy/ssh-action@v1.2.0
+        continue-on-error: true
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            mkdir -p ~/deployments
+            echo "$(date): ${{ needs.prepare.outputs.env_name }} deployment ${{ needs.verify.result }} - Version ${{ needs.prepare.outputs.version }}" >> ~/deployments/deployment.log
