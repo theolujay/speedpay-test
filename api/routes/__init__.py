@@ -7,6 +7,7 @@ api = NinjaAPI(
     title="Speedpay API",
     version="0.1.0",
     description="Digital wallet API with JWT authentication",
+    docs_url=None,
 )
 
 api.add_exception_handler(Exception, api_exception_handler)

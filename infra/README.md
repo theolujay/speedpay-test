@@ -187,7 +187,7 @@ If containers hit memory limits:
 3. Redeploy: `make infra/deploy`
 
 ### Health Checks
-The API exposes `/api/docs`. Check service status:
+The API exposes `/docs`. Check service status:
 ```bash
 docker service ls --filter name=speedpay
 docker service ps speedpay_app --no-trunc

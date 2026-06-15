@@ -76,7 +76,7 @@ x-app-env: &app-env
   PAYSTACK_PUBLIC_KEY__FILE: /run/secrets/paystack_public_key
   DOMAIN: ${DOMAIN:-speedpay.theolujay.dev}
   ALLOWED_HOSTS: ${DOMAIN:-speedpay.theolujay.dev},localhost
-  CALLBACK_URL: https://${DOMAIN:-speedpay.theolujay.dev}/api/docs
+  CALLBACK_URL: https://${DOMAIN:-speedpay.theolujay.dev}/docs
 
 networks:
   speedpay_net:
@@ -214,7 +214,7 @@ services:
       replicas: 2
       labels:
         - "traefik.enable=true"
-        - "traefik.docker.network=speedpay_net"
+        - "traefik.swarm.network=speedpay_net"
         - "traefik.http.services.speedpay.loadbalancer.server.port=8000"
         - "traefik.http.routers.speedpay.rule=Host(`${DOMAIN:-speedpay.theolujay.dev}`)"
         - "traefik.http.routers.speedpay.entrypoints=websecure"

@@ -106,7 +106,7 @@ PAYSTACK_SECRET_KEY = getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = getenv("PAYSTACK_PUBLIC_KEY")
 CALLBACK_URL = getenv(
     "CALLBACK_URL",
-    "http://localhost:8000/api/docs",
+    "http://localhost:8000/docs",
 )
 
 LOGGING = {

@@ -1,9 +1,13 @@
+from functools import partial
+
 from django.contrib import admin
 from django.urls import path
 from django.views.generic.base import RedirectView
 from django.conf import settings
 from django.conf.urls.static import static
 from django.views.static import serve
+
+from ninja.openapi.views import openapi_view
 
 from api.routes import api
 
@@ -15,13 +19,14 @@ def root(request):
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("api/", api.urls),
+    path("v1/", api.urls),
     path(
         "favicon.ico",
         serve,
         {"path": "favicon.ico", "document_root": settings.BASE_DIR},
     ),
-    path("", RedirectView.as_view(url="api/docs/", permanent=False)),
+    path("docs/", partial(openapi_view, api=api), name="openapi-view"),
+    path("", RedirectView.as_view(url="docs/", permanent=False)),
 ]
 
 urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
